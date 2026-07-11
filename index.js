@@ -139,6 +139,24 @@ bot.start((ctx) => {
   return ctx.reply(`Hello! This is the ${cfg.COMPANY_NAME} attendance bot.\nPlease enter your employee ID:`);
 });
 
+bot.command("health", async (ctx) => {
+  let groupOk;
+  try {
+    await bot.telegram.sendMessage(cfg.GROUP_CHAT_ID, "🩺 Health check — please ignore.");
+    groupOk = "✅ OK";
+  } catch (e) {
+    groupOk = `❌ ${e.message}`;
+  }
+  const streams = [...streamState.entries()]
+    .map(([k, v]) => `${k}: ${v.live ? "LIVE" : "sync"}`)
+    .join("\n") || "(no device events seen yet)";
+  const subs = store.chatsForEmployee ? "" : "";
+  return ctx.reply(
+    `🩺 <b>Health</b>\nBot: ✅ running\nGroup send (${cfg.GROUP_CHAT_ID}): ${groupOk}\nDevice streams:\n${streams}`,
+    { parse_mode: "HTML" }
+  );
+});
+
 bot.command("stop", (ctx) => {
   store.unsubscribe(ctx.chat.id);
   regState.delete(ctx.chat.id);
@@ -555,7 +573,10 @@ if (!TEST_MODE) {
     console.log(`HTTP listener: 0.0.0.0:${cfg.PORT}${cfg.EVENT_PATH}`);
   });
 
-  bot.launch().then(() => console.log("Telegram bot started"));
+  bot.telegram.getMe()
+    .then((me) => console.log(`Telegram OK ✅ — bot @${me.username} is ready`))
+    .catch((e) => console.error(`TELEGRAM ERROR ❌ — token or network problem: ${e.message}`));
+  bot.launch().catch((e) => console.error(`bot.launch failed: ${e.message}`));
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
