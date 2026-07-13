@@ -71,6 +71,12 @@ function localMinutes(ts) {
 
 const toMin = (s) => { const [h, m] = s.split(":").map(Number); return h * 60 + m; };
 
+// Day of week in the configured timezone: 0=Sunday ... 6=Saturday
+function localDayOfWeek(ts) {
+  const name = new Intl.DateTimeFormat("en-US", { timeZone: cfg.TZ, weekday: "short" }).format(new Date(ts));
+  return ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(name);
+}
+
 function addDays(dateStr, days) {
   const d = new Date(dateStr + "T00:00:00Z");
   d.setUTCDate(d.getUTCDate() + days);
@@ -355,6 +361,7 @@ setInterval(async () => {
 // of shift start, alert the employee DM + the group ONCE per shift date.
 setInterval(async () => {
   const now = Date.now();
+  if (cfg.NO_SHOW_OFF_DAYS.includes(localDayOfWeek(now))) return; // day off (e.g. Sunday) — no No Show alerts
   const today = fmtDate(now);
   const m = localMinutes(now);
   for (const [id, info] of Object.entries(EMPLOYEES)) {

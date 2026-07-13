@@ -30,6 +30,9 @@ module.exports = {
     key: (process.env.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
   },
 
+  // Days when No Show alerts are NOT sent (0=Sunday, 1=Monday ... 6=Saturday)
+  NO_SHOW_OFF_DAYS: [0],
+
   BREAK_LIMIT_MIN: 30,          // break limit (minutes)
   DEDUP_SECONDS: 180,           // window for ignoring repeated face scans
 
