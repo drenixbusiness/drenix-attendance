@@ -14,12 +14,12 @@ if (cfg.SHEET.id && cfg.SHEET.email && cfg.SHEET.key) {
  * Qator qo'shadi: [Sana, ID, Ism, Hodisa, Vaqt, Izoh]
  * Xato bo'lsa botni to'xtatmaydi, faqat konsolga yozadi.
  */
-async function appendRow(row) {
+async function appendRow(row, sheetName) {
   if (!sheets) return;
   try {
     await sheets.spreadsheets.values.append({
       spreadsheetId: cfg.SHEET.id,
-      range: `${cfg.SHEET.name}!A:F`,
+      range: `${sheetName || cfg.SHEET.name}!A:F`,
       valueInputOption: "USER_ENTERED",
       requestBody: { values: [row] },
     });

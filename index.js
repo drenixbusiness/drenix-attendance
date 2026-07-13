@@ -34,6 +34,23 @@ const { startPolling } = require("./poller");
 const TEST_MODE = process.env.DRENIX_TEST === "1"; // unit tests only — never set in production
 
 const EMPLOYEES = JSON.parse(fs.readFileSync(path.join(__dirname, "employees.json"), "utf8"));
+
+// Multi-company support: each employee may have a "company" key that maps to
+// an entry in companies.json (its own Telegram group and Sheets tab).
+// Employees without a company fall back to the defaults from .env.
+const COMPANIES_FILE = path.join(__dirname, "companies.json");
+const COMPANIES = fs.existsSync(COMPANIES_FILE)
+  ? JSON.parse(fs.readFileSync(COMPANIES_FILE, "utf8"))
+  : {};
+
+function companyFor(emp) {
+  const c = (emp && emp.company && COMPANIES[emp.company]) || {};
+  return {
+    label: c.label || cfg.COMPANY_NAME,
+    groupChatId: c.groupChatId || cfg.GROUP_CHAT_ID,
+    sheetName: c.sheetName || undefined, // undefined -> sheets.js default
+  };
+}
 const EVENTS_LOG = path.join(__dirname, "events.log");
 
 // ============================= HELPERS =============================
@@ -104,11 +121,11 @@ if (TEST_MODE) {
   };
 }
 
-async function sendToGroup(text) {
+async function sendToGroup(text, chatId = cfg.GROUP_CHAT_ID) {
   try {
-    await bot.telegram.sendMessage(cfg.GROUP_CHAT_ID, text, { parse_mode: "HTML" });
+    await bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML" });
   } catch (e) {
-    console.error("Failed to send to group:", e.message);
+    console.error(`Failed to send to group ${chatId}:`, e.message);
     console.error("  -> Check: is the bot added to the group? If the group was upgraded to a supergroup, its ID changed (starts with -100...) — update TELEGRAM_CHAT_ID in .env.");
   }
 }
@@ -123,11 +140,12 @@ async function sendToEmployee(empId, text) {
   }
 }
 
-// Check-in / check-out / no-show -> employee DM + group
-async function notifyBoth(empId, text) {
-  console.log(`[notify DM+group] empId=${empId}: ${text.split("\n")[0].replace(/<[^>]+>/g, "")}`);
-  await sendToEmployee(empId, text);
-  await sendToGroup(text);
+// Check-in / check-out / no-show -> employee DM + the employee's COMPANY group
+async function notifyBoth(emp, text) {
+  const co = companyFor(emp);
+  console.log(`[notify DM+group ${co.label}] empId=${emp.id}: ${text.split("\n")[0].replace(/<[^>]+>/g, "")}`);
+  await sendToEmployee(emp.id, text);
+  await sendToGroup(text, co.groupChatId);
 }
 
 // Breaks and break warnings -> employee DM only
@@ -146,19 +164,23 @@ bot.start((ctx) => {
 });
 
 bot.command("health", async (ctx) => {
-  let groupOk;
-  try {
-    await bot.telegram.sendMessage(cfg.GROUP_CHAT_ID, "🩺 Health check — please ignore.");
-    groupOk = "✅ OK";
-  } catch (e) {
-    groupOk = `❌ ${e.message}`;
+  const groups = Object.keys(COMPANIES).length
+    ? Object.entries(COMPANIES).map(([k, c]) => [c.label || k, c.groupChatId])
+    : [[cfg.COMPANY_NAME, cfg.GROUP_CHAT_ID]];
+  const results = [];
+  for (const [label, chatId] of groups) {
+    try {
+      await bot.telegram.sendMessage(chatId, `🩺 ${label} health check — please ignore.`);
+      results.push(`${label} (${chatId}): ✅ OK`);
+    } catch (e) {
+      results.push(`${label} (${chatId}): ❌ ${e.message}`);
+    }
   }
   const streams = [...streamState.entries()]
     .map(([k, v]) => `${k}: ${v.live ? "LIVE" : "sync"}`)
     .join("\n") || "(no device events seen yet)";
-  const subs = store.chatsForEmployee ? "" : "";
   return ctx.reply(
-    `🩺 <b>Health</b>\nBot: ✅ running\nGroup send (${cfg.GROUP_CHAT_ID}): ${groupOk}\nDevice streams:\n${streams}`,
+    `🩺 <b>Health</b>\nBot: ✅ running\nGroups:\n${results.join("\n")}\nDevice streams:\n${streams}`,
     { parse_mode: "HTML" }
   );
 });
@@ -203,7 +225,7 @@ bot.on("text", (ctx) => {
     regState.delete(ctx.chat.id);
     store.subscribe(ctx.chat.id, emp.id);
     return ctx.reply(
-      `✅ Connected: <b>${emp.name}</b> (${SHIFT_RULES[emp.shiftKey]?.label || emp.shiftKey})\nYour check-in/check-out notifications will arrive here.\nSend /stop to disconnect.`,
+      `✅ Connected: <b>${emp.name}</b> — ${companyFor(emp).label} (${SHIFT_RULES[emp.shiftKey]?.label || emp.shiftKey})\nYour check-in/check-out notifications will arrive here.\nSend /stop to disconnect.`,
       { parse_mode: "HTML" }
     );
   }
@@ -226,9 +248,9 @@ async function doCheckIn(emp, ts, devName, rule, today) {
   const m = localMinutes(ts);
   store.setArrival(emp.id, today, ts);
   const st = arrivalStatus(m, rule);
-  await notifyBoth(emp.id,
+  await notifyBoth(emp,
     `🏢 <b>CHECKED IN</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n🕐 ${fmtTime(ts)}\n${st.text}\n📟 ${devName}`);
-  appendRow([today, emp.id, emp.name, "Checked in", fmtTime(ts), st.note]);
+  appendRow([today, emp.id, emp.name, "Checked in", fmtTime(ts), st.note], companyFor(emp).sheetName);
 }
 
 // Direction-aware event handling.
@@ -248,9 +270,9 @@ async function doCheckOut(emp, rule, ts, devName, workDate, rec) {
   store.setDeparture(emp.id, workDate, ts);
   const workedMin = Math.round((ts - rec.arrival) / 60000);
   const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
-  await notifyBoth(emp.id,
+  await notifyBoth(emp,
     `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${workDate}\n🕐 ${fmtTime(ts)}\n⏱ Worked: ${worked}\n📟 ${devName}`);
-  appendRow([workDate, emp.id, emp.name, "Checked out", fmtTime(ts), `Worked: ${worked}`]);
+  appendRow([workDate, emp.id, emp.name, "Checked out", fmtTime(ts), `Worked: ${worked}`], companyFor(emp).sheetName);
 }
 
 async function doBreakIn(emp, ts, devName, open) {
@@ -262,14 +284,14 @@ async function doBreakIn(emp, ts, devName, open) {
     (over ? `\n🔴 <b>Exceeded the limit by ${minWord(dur - cfg.BREAK_LIMIT_MIN)}!</b>` : `\n✅ Within the limit`) +
     `\n📟 ${devName}`);
   appendRow([open.work_date, emp.id, emp.name, "Back from break", fmtTime(ts),
-    over ? `${dur} min (over limit)` : `${dur} min`]);
+    over ? `${dur} min (over limit)` : `${dur} min`], companyFor(emp).sheetName);
 }
 
 async function doBreakOut(emp, ts, devName, workDate) {
   store.startBreak(emp.id, workDate, ts);
   await notifyDM(emp.id,
     `☕ <b>ON BREAK</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\n⏳ Limit: ${minWord(cfg.BREAK_LIMIT_MIN)}\n📟 ${devName}`);
-  appendRow([workDate, emp.id, emp.name, "Break started", fmtTime(ts), ""]);
+  appendRow([workDate, emp.id, emp.name, "Break started", fmtTime(ts), ""], companyFor(emp).sheetName);
 }
 
 async function handleAuthEvent(emp, ts, deviceIp, kind) {
@@ -308,8 +330,12 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
   }
 
   // ============ INSIDE device — leaving the building ============
-  // 1) Check-out window -> CHECK OUT for the corresponding shift date.
-  if (m >= toMin(rule.validCheckOutFrom) && m <= toMin(rule.validCheckOutTo)) {
+  // 1) Check-out window -> CHECK OUT, but ONLY with a fingerprint (or an
+  //    unrecognized auth code — some firmwares report fingerprints with
+  //    unknown codes). Face ID NEVER checks out: after the shift ends the
+  //    employee may still go to the store with Face ID before finally leaving
+  //    with a fingerprint — those Face ID exits/returns are breaks.
+  if (kind !== "face" && m >= toMin(rule.validCheckOutFrom) && m <= toMin(rule.validCheckOutTo)) {
     const workDate = addDays(today, -rule.checkOutDayOffset);
     const rec = store.getAttendance(emp.id, workDate);
     if (rec && rec.arrival && !rec.departure) {
@@ -353,7 +379,7 @@ setInterval(async () => {
     const dur = Math.round((now - b.out_ts) / 60000);
     await notifyDM(b.emp_id,
       `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}`);
-    appendRow([b.work_date, b.emp_id, emp.name, "WARNING", fmtTime(now), `Break ${dur} min — over limit`]);
+    appendRow([b.work_date, b.emp_id, emp.name, "WARNING", fmtTime(now), `Break ${dur} min — over limit`], companyFor(emp).sheetName);
   }
 }, 60 * 1000);
 
@@ -373,9 +399,10 @@ setInterval(async () => {
     if (rec && rec.arrival) continue;               // already checked in
     if (store.noShowSent(id, today)) continue;      // already alerted
     store.markNoShow(id, today);
-    await notifyBoth(id,
+    const empObj = { id, ...info };
+    await notifyBoth(empObj,
       `🚫 <b>No Show Alert</b>\n👤 Name: ${info.name}\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${today}\n⏱️ No check-in received within ${graceMin} minutes of shift start`);
-    appendRow([today, id, info.name, "No Show", fmtTime(now), `No check-in within ${graceMin} min of shift start`]);
+    appendRow([today, id, info.name, "No Show", fmtTime(now), `No check-in within ${graceMin} min of shift start`], companyFor(empObj).sheetName);
   }
 }, 60 * 1000);
 

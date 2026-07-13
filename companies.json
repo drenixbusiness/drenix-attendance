@@ -1,0 +1,22 @@
+{
+  "drenix": {
+    "label": "Drenix",
+    "groupChatId": "-5259287256",
+    "sheetName": "Drenix"
+  },
+  "jm": {
+    "label": "JM",
+    "groupChatId": "-5206027752",
+    "sheetName": "JM"
+  },
+  "bp": {
+    "label": "BP",
+    "groupChatId": "-5170004534",
+    "sheetName": "BP"
+  },
+  "wf": {
+    "label": "WF",
+    "groupChatId": "-5148337669",
+    "sheetName": "WF"
+  }
+}

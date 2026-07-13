@@ -115,8 +115,10 @@ function startPolling(ip, port, user, pass, onEvent, log = console.log, interval
       errStreak = 0;
     } catch (e) {
       errStreak++;
-      if (errStreak <= 3 || errStreak % 15 === 0) {
-        log(`[poller ${ip}:${port}] error: ${e.message}`);
+      // Single transient failures (device reset a connection) are retried on
+      // the next 4s tick — only log when the problem PERSISTS.
+      if (errStreak === 3 || errStreak % 15 === 0) {
+        log(`[poller ${ip}:${port}] still failing after ${errStreak} attempts: ${e.message}`);
       }
     } finally {
       inFlight = false;

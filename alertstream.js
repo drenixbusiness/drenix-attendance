@@ -77,11 +77,20 @@ function subscribeDevice(ip, port, user, pass, onEvent, log = console.log, onCon
   let alive = true;
   let retryTimer = null;
 
-  const retry = (reason) => {
+  const retry = (reason, delayMs = 5000) => {
     if (!alive) return;
-    log(`[alertStream ${ip}:${port}] disconnected (${reason}), retrying in 5s...`);
+    log(`[alertStream ${ip}:${port}] disconnected (${reason}), retrying in ${Math.round(delayMs / 1000)}s...`);
     clearTimeout(retryTimer);
-    retryTimer = setTimeout(connect, 5000);
+    retryTimer = setTimeout(connect, delayMs);
+  };
+
+  // Some firmwares don't expose the alertStream endpoint at all (HTTP 404).
+  // That's fine — the 4s poller still delivers every event. Log it once in a
+  // friendly way and only re-check hourly instead of spamming every 5s.
+  const notSupported = () => {
+    log(`[alertStream ${ip}:${port}] not supported by this device firmware (HTTP 404) — no problem, the 4s poller handles all events. Re-checking hourly.`);
+    clearTimeout(retryTimer);
+    retryTimer = setTimeout(connect, 60 * 60 * 1000);
   };
 
   const consume = (res) => {
@@ -126,7 +135,11 @@ function subscribeDevice(ip, port, user, pass, onEvent, log = console.log, onCon
           (res2) => {
             if (res2.statusCode === 200) return consume(res2);
             res2.resume();
-            retry(`auth failed, HTTP ${res2.statusCode} — check DEVICE_USERNAME/DEVICE_PASSWORD in .env`);
+            if (res2.statusCode === 404) return notSupported();
+            if (res2.statusCode === 401 || res2.statusCode === 403) {
+              return retry(`auth failed, HTTP ${res2.statusCode} — check DEVICE_USERNAME/DEVICE_PASSWORD in .env`, 30000);
+            }
+            retry(`HTTP ${res2.statusCode}`);
           }
         );
         req2.on("error", (e) => retry(e.message));
@@ -134,6 +147,7 @@ function subscribeDevice(ip, port, user, pass, onEvent, log = console.log, onCon
         return;
       }
       res1.resume();
+      if (res1.statusCode === 404) return notSupported();
       retry(`HTTP ${res1.statusCode}`);
     });
     req1.on("timeout", () => { req1.destroy(); retry("connect timeout"); });
@@ -145,18 +159,30 @@ function subscribeDevice(ip, port, user, pass, onEvent, log = console.log, onCon
   return () => { alive = false; clearTimeout(retryTimer); };
 }
 
+// Keep-alive agents per device: reuse TCP connections instead of opening a
+// new one for every poll — Hikvision terminals reset connections under the
+// load of multiple rapidly-connecting clients.
+const keepAliveAgents = new Map();
+function agentFor(ip, port) {
+  const k = `${ip}:${port}`;
+  if (!keepAliveAgents.has(k)) {
+    keepAliveAgents.set(k, new http.Agent({ keepAlive: true, keepAliveMsecs: 3000, maxSockets: 2 }));
+  }
+  return keepAliveAgents.get(k);
+}
+
 /**
  * One-shot HTTP request with Digest auth that returns parsed JSON.
  * Used by the poller for /ISAPI/System/time and /ISAPI/AccessControl/AcsEvent.
  */
-function digestTextRequest(ip, port, user, pass, method, path, bodyObj) {
+function digestTextRequestOnce(ip, port, user, pass, method, path, bodyObj) {
   return new Promise((resolve, reject) => {
     const body = bodyObj ? JSON.stringify(bodyObj) : null;
     const doReq = (authHeader) => {
       const headers = { "Content-Type": "application/json" };
       if (body) headers["Content-Length"] = Buffer.byteLength(body);
       if (authHeader) headers["Authorization"] = authHeader;
-      const req = http.request({ host: ip, port, path, method, headers, timeout: 10000 }, (res) => {
+      const req = http.request({ host: ip, port, path, method, headers, timeout: 10000, agent: agentFor(ip, port) }, (res) => {
         let data = "";
         res.setEncoding("utf8");
         res.on("data", (c) => (data += c));
@@ -179,6 +205,20 @@ function digestTextRequest(ip, port, user, pass, method, path, bodyObj) {
     };
     doReq(null);
   });
+}
+
+// Transient connection drops (device closed an idle keep-alive socket, brief
+// overload from multiple polling clients) are retried automatically.
+const TRANSIENT = ["ECONNRESET", "socket hang up", "EPIPE", "ETIMEDOUT", "request timeout"];
+async function digestTextRequest(ip, port, user, pass, method, path, bodyObj) {
+  try {
+    return await digestTextRequestOnce(ip, port, user, pass, method, path, bodyObj);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (!TRANSIENT.some((t) => msg.includes(t))) throw e;
+    await new Promise((r) => setTimeout(r, 300));
+    return digestTextRequestOnce(ip, port, user, pass, method, path, bodyObj);
+  }
 }
 
 async function digestJsonRequest(ip, port, user, pass, method, path, bodyObj) {
