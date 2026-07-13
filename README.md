@@ -1,4 +1,4 @@
-# Drenix Attendance Bot — Setup (Windows, 10.1.1.133)
+# Drenix Attendance Bot
 
 ## 1. REQUIRED: fill in device credentials
 Open `.env` and set:
@@ -8,7 +8,7 @@ DEVICE_PASSWORD=<the password you use to log in to the device web page>
 DEVICE_HTTP_PORT=90
 ```
 This enables the **alertStream** connection — the bot connects directly to both
-devices (10.1.1.211 and 10.1.1.248, HTTP port 90) and pulls events in REAL TIME.
+devices and pulls events in REAL TIME.
 This is the primary, reliable path and does not depend on the devices' HTTP
 Listening push settings.
 
@@ -17,13 +17,6 @@ Listening push settings.
 cd C:\drenix-bot
 npm install
 node index.js
-```
-Expected console output:
-```
-HTTP listener: 0.0.0.0:8090/hikvision/event
-[alertStream 10.1.1.211:90] connected ✅ (real-time events active)
-[alertStream 10.1.1.248:90] connected ✅ (real-time events active)
-Telegram bot started
 ```
 If you see `auth failed` — the DEVICE_USERNAME/DEVICE_PASSWORD in `.env` is wrong.
 
@@ -58,8 +51,8 @@ Example, shift 6-3 (work 18:00–03:00):
 - Check-in, check-out and No Show messages go to the employee DM **and** the group.
 
 ### Face ID (breaks) — direction-based
-- **Inside device (10.1.1.211) = exit**: face here = BREAK STARTED (only during an active shift).
-- **Outside device (10.1.1.248) = entry**: face here = BACK FROM BREAK if an open break exists. If there is NO open break (the employee walked out earlier without scanning, behind a colleague), the scan is **IGNORED** — entering can never open a break, so tailgating no longer creates false break-outs.
+- **Inside device = exit**: face here = BREAK STARTED (only during an active shift).
+- **Outside device = entry**: face here = BACK FROM BREAK if an open break exists. If there is NO open break (the employee walked out earlier without scanning, behind a colleague), the scan is **IGNORED** — entering can never open a break, so tailgating no longer creates false break-outs.
 - Any scan (face, fingerprint, or even an unrecognized event code) on the OUTSIDE device with no check-in yet, inside the check-in zone, counts as CHECK-IN — a forgotten fingerprint or unknown code can never swallow a check-in.
 - A fingerprint on the INSIDE device in the check-in zone with no check-in yet also counts as CHECK-IN (wrong-device mistake).
 - If a break exceeds 30 minutes: **one single warning**. Duration is shown when they return.
@@ -68,7 +61,7 @@ Example, shift 6-3 (work 18:00–03:00):
 ### Telegram
 - `/start` → employee enters their ID ("001" or "1" both work) → then their **personal secret code** (from `employees.json`, case-insensitive; 3 wrong attempts reset the flow) → personal notifications in DM. Secrets are handed to each employee individually by the administrator.
 - `/stop` → unsubscribes and clears their data.
-- The group (`-5259287256`) receives every event.
+- The group receives every event.
 
 ### Google Sheets
 Every event is appended to the `Drenix` sheet: `Date | ID | Name | Event | Time | Note`.
