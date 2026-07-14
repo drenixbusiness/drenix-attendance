@@ -76,11 +76,11 @@ function startPolling(ip, port, user, pass, onEvent, log = console.log, interval
     if (inFlight) return;
     inFlight = true;
     try {
-      if (clockOffset === null || Date.now() - lastClockSync > 10 * 60 * 1000) {
+      if (clockOffset === null || Date.now() - lastClockSync > 2 * 60 * 1000) {
         await syncClock();
       }
       const devNow = Date.now() + clockOffset;
-      const infos = await fetchWindow(isoInTz(devNow - 120000, tzSuffix), isoInTz(devNow + 120000, tzSuffix));
+      const infos = await fetchWindow(isoInTz(devNow - 5 * 60 * 1000, tzSuffix), isoInTz(devNow + 2 * 60 * 1000, tzSuffix));
 
       let maxSerial = lastSerial;
       const fresh = [];

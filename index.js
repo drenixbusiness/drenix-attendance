@@ -166,8 +166,17 @@ const regState = new Map();
 const MAX_SECRET_ATTEMPTS = 3;
 
 bot.start((ctx) => {
+  // Already registered? Stay registered until /stop — just remind them.
+  const existingEmpId = store.subscriptionFor(ctx.chat.id);
+  if (existingEmpId) {
+    const emp = findEmployee(existingEmpId, true) || { id: existingEmpId, name: `Employee #${existingEmpId}` };
+    return ctx.reply(
+      `✅ You are already registered as <b>${emp.name}</b> (${companyFor(emp).label}).\nYour check-in/check-out notifications will keep arriving here.\nSend /stop if you want to disconnect.`,
+      { parse_mode: "HTML" }
+    );
+  }
   regState.set(ctx.chat.id, { stage: "id" });
-  return ctx.reply(`Hello! This is the ${cfg.COMPANY_NAME} attendance bot.\nPlease enter your employee ID:`);
+  return ctx.reply(`Hello! This is the attendance bot.\nPlease enter your employee ID:`);
 });
 
 bot.command("health", async (ctx) => {
@@ -294,11 +303,12 @@ async function doBreakIn(emp, ts, devName, open) {
     over ? `${dur} min (over limit)` : `${dur} min`], companyFor(emp).sheetName);
 }
 
-async function doBreakOut(emp, ts, devName, workDate) {
+async function doBreakOut(emp, ts, devName, workDate, note = "") {
   store.startBreak(emp.id, workDate, ts);
   await notifyDM(emp.id,
-    `☕ <b>ON BREAK</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\n⏳ Limit: ${minWord(cfg.BREAK_LIMIT_MIN)}\n📟 ${devName}`);
-  appendRow([workDate, emp.id, emp.name, "Break started", fmtTime(ts), ""], companyFor(emp).sheetName);
+    `☕ <b>ON BREAK</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\n⏳ Limit: ${minWord(cfg.BREAK_LIMIT_MIN)}` +
+    (note ? `\nℹ️ ${note}` : "") + `\n📟 ${devName}`);
+  appendRow([workDate, emp.id, emp.name, "Break started", fmtTime(ts), note], companyFor(emp).sheetName);
 }
 
 async function handleAuthEvent(emp, ts, deviceIp, kind) {
@@ -330,10 +340,19 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
       const label = kind === "face" ? `${devName} (via Face ID)` : devName;
       return doCheckIn(emp, ts, label, rule, today);
     }
-    // 3) Everything else: already checked in, no open break -> the employee
-    //    left earlier WITHOUT scanning (tailgated behind a colleague) or this
-    //    is a duplicate scan. Entering can never open a break -> IGNORE.
-    return logEvent(`IGNORE outside ${kind}: ${emp.name} — no open break & already checked in (tailgated exit or duplicate)`);
+    // 3) Checked in, no open break: the EXIT scan was missed (or the employee
+    //    walked out behind a colleague). NEVER drop this silently — but first
+    //    filter genuine duplicates (repeated door scans within 60s).
+    const lastClosed = store.lastClosedBreak(emp.id);
+    if ((todayRec && todayRec.arrival && ts - todayRec.arrival < 60 * 1000) ||
+        (lastClosed && lastClosed.in_ts && ts - lastClosed.in_ts < 60 * 1000)) {
+      return logEvent(`DEDUP outside ${kind}: ${emp.name} — repeated door scan`);
+    }
+    logEvent(`ENTER-only outside ${kind}: ${emp.name} — no matching exit scan before this entry`);
+    await notifyDM(emp.id,
+      `🚶 <b>ENTERED</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\nℹ️ No exit scan was recorded before this entry, so no break was counted.\n📟 ${devName}`);
+    appendRow([today, emp.id, emp.name, "Entered (no exit scan)", fmtTime(ts), ""], companyFor(emp).sheetName);
+    return;
   }
 
   // ============ INSIDE device — leaving the building ============
@@ -346,6 +365,10 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
     const workDate = addDays(today, -rule.checkOutDayOffset);
     const rec = store.getAttendance(emp.id, workDate);
     if (rec && rec.arrival && !rec.departure) {
+      if (open) {
+        store.endBreak(open.id, ts);
+        logEvent(`AUTO-CLOSE open break for ${emp.name} at checkout`);
+      }
       return doCheckOut(emp, rule, ts, devName, workDate, rec);
     }
     if (rec && rec.departure) {
@@ -356,17 +379,24 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
 
   const session = store.activeSession(emp.id);
   if (session) {
+    // A scan right after check-in is a door double-scan, not a break
+    if (ts - session.arrival < 60 * 1000) {
+      return logEvent(`DEDUP inside ${kind}: ${emp.name} — scan right after check-in, not a break`);
+    }
     if (open) {
-      return logEvent(`IGNORE inside ${kind}: ${emp.name} already on break (duplicate exit scan)`);
-    }
-    if (kind === "face") {
-      // A face scan right after a face check-in is a duplicate, not a break
-      if (ts - session.arrival < cfg.DEDUP_SECONDS * 1000) {
-        return logEvent(`DEDUP inside face: ${emp.name} — scan right after check-in, not a break`);
+      if (ts - open.out_ts < 60 * 1000) {
+        return logEvent(`DEDUP inside ${kind}: ${emp.name} — repeated exit scan`);
       }
-      return doBreakOut(emp, ts, devName, session.work_date);
+      // The RETURN scan of the previous break was never recorded. Do NOT let
+      // one missed event poison the chain: close the stale break now and
+      // start a fresh one with an explanatory note.
+      store.endBreak(open.id, ts);
+      logEvent(`AUTO-CLOSE stale break for ${emp.name} (return scan was missed); starting a new break`);
+      return doBreakOut(emp, ts, devName, session.work_date, "Previous break's return scan was not recorded — it was closed automatically.");
     }
-    return logEvent(`IGNORE inside ${kind}: ${emp.name} — mid-shift ${kind} on exit device (breaks use Face ID)`);
+    // ANY scan type on the exit device mid-shift is a break-out (employees may
+    // habitually use a fingerprint at the door) — events must never be lost.
+    return doBreakOut(emp, ts, devName, session.work_date);
   }
 
   // No active session: a fingerprint here in the check-in zone means the
@@ -515,6 +545,7 @@ async function processEvent(evt, sourceIp, source) {
     }
 
     const ts = Date.now();
+    console.log(`[event ${source}] ${emp.name} (${emp.id}) ${kind.toUpperCase()} @ ${deviceLabel(deviceIp)}`);
     await handleAuthEvent(emp, ts, deviceIp, kind);
   } catch (e) {
     console.error("Error while processing event:", e);

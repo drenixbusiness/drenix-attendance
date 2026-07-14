@@ -44,6 +44,10 @@ module.exports = {
   subscribe: (chatId, empId) =>
     db.prepare("INSERT OR REPLACE INTO subscriptions (chat_id, emp_id) VALUES (?, ?)").run(String(chatId), String(empId)),
   unsubscribe: (chatId) => db.prepare("DELETE FROM subscriptions WHERE chat_id=?").run(String(chatId)),
+  subscriptionFor: (chatId) => {
+    const r = db.prepare("SELECT emp_id FROM subscriptions WHERE chat_id=?").get(String(chatId));
+    return r ? r.emp_id : null;
+  },
   chatsForEmployee: (empId) =>
     db.prepare("SELECT chat_id FROM subscriptions WHERE emp_id=?").all(String(empId)).map(r => r.chat_id),
 
