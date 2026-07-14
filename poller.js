@@ -50,7 +50,7 @@ function startPolling(ip, port, user, pass, onEvent, log = console.log, interval
   async function fetchWindow(startIso, endIso) {
     const infos = [];
     let pos = 0;
-    for (let page = 0; page < 5; page++) {
+    for (let page = 0; page < 10; page++) {
       const body = {
         AcsEventCond: {
           searchID: "drenix-attendance-bot",

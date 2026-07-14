@@ -55,11 +55,18 @@ const EVENTS_LOG = path.join(__dirname, "events.log");
 
 // ============================= HELPERS =============================
 
-// The device may send "001" as "1" — match both forms
-function findEmployee(rawId) {
+// Employee lookup.
+// exact=true (DEVICE EVENTS): the device always reports IDs verbatim with
+//   leading zeros ("001", "036"), and device person "1" (e.g. ADMIN) is a
+//   DIFFERENT person from "001" — so events must match keys exactly.
+//   (Zero-stripping here previously mapped ADMIN's scans onto employee "001",
+//   which made a second back-to-back employee get "already checked in".)
+// exact=false (/start registration): typing convenience — "1" finds "001".
+function findEmployee(rawId, exact = false) {
   if (!rawId) return null;
   const id = String(rawId).trim();
   if (EMPLOYEES[id]) return { id, ...EMPLOYEES[id] };
+  if (exact) return null;
   const noZeros = id.replace(/^0+/, "") || "0";
   for (const key of Object.keys(EMPLOYEES)) {
     if ((key.replace(/^0+/, "") || "0") === noZeros) return { id: key, ...EMPLOYEES[key] };
@@ -375,7 +382,7 @@ setInterval(async () => {
   const now = Date.now();
   for (const b of store.overdueBreaks(cfg.BREAK_LIMIT_MIN * 60000, now)) {
     store.markWarned(b.id);
-    const emp = findEmployee(b.emp_id) || { id: b.emp_id, name: `Employee #${b.emp_id}` };
+    const emp = findEmployee(b.emp_id, true) || { id: b.emp_id, name: `Employee #${b.emp_id}` };
     const dur = Math.round((now - b.out_ts) / 60000);
     await notifyDM(b.emp_id,
       `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}`);
@@ -489,7 +496,7 @@ async function processEvent(evt, sourceIp, source) {
     const deviceIp = evt.ipAddress || sourceIp || "?";
     logEvent(`src=${source} | ip=${deviceIp} | empId=${rawId} | name=${ace.name || "-"} | subEventType=${sub} | verifyMode=${ace.currentVerifyMode || "-"} | ${kind ? kind.toUpperCase() : "UNKNOWN"}`);
 
-    const emp = findEmployee(rawId);
+    const emp = findEmployee(rawId, true); // exact — device IDs are verbatim
     if (!emp) return logEvent(`IGNORE: empId=${rawId} not found in employees.json`);
 
     if (!kind) {
