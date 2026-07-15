@@ -77,6 +77,13 @@ module.exports = {
   markNoShow: (empId, workDate) =>
     db.prepare("INSERT OR IGNORE INTO noshow (emp_id, work_date) VALUES (?, ?)").run(String(empId), workDate),
 
+  allOpenBreaks: () =>
+    db.prepare("SELECT * FROM breaks WHERE in_ts IS NULL").all(),
+  voidBreak: (id) =>
+    db.prepare("UPDATE breaks SET in_ts = out_ts, warned = 1 WHERE id=?").run(Number(id)),
+  staleSessions: () =>
+    db.prepare("SELECT * FROM attendance WHERE arrival IS NOT NULL AND departure IS NULL").all(),
+
   overdueBreaks: (limitMs, now) =>
     db.prepare("SELECT * FROM breaks WHERE in_ts IS NULL AND warned=0 AND ? - out_ts > ?").all(now, limitMs),
 };

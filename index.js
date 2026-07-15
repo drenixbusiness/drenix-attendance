@@ -372,7 +372,14 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
       return doCheckOut(emp, rule, ts, devName, workDate, rec);
     }
     if (rec && rec.departure) {
-      return logEvent(`IGNORE inside ${kind}: ${emp.name} already checked out (${workDate})`);
+      if (rec.departure > 0 && ts - rec.departure < 120 * 1000) {
+        return logEvent(`DEDUP inside ${kind}: ${emp.name} — door scan right after checkout`);
+      }
+      logEvent(`EXIT after checkout: ${emp.name} (${workDate})`);
+      await notifyDM(emp.id,
+        `🚪 <b>EXITED</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\nℹ️ You had already checked out — this exit is not counted.\n📟 ${devName}`);
+      appendRow([workDate, emp.id, emp.name, "Exited (after checkout)", fmtTime(ts), ""], companyFor(emp).sheetName);
+      return;
     }
     // no check-in for that shift date — fall through to the session logic
   }
@@ -404,21 +411,96 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
   if (kind === "fp" && (!todayRec || !todayRec.arrival) && m >= toMin(rule.validCheckInFrom)) {
     return doCheckIn(emp, ts, `${devName} (wrong device)`, rule, today);
   }
-  return logEvent(`IGNORE inside ${kind}: ${emp.name} — not checked in`);
+  // Distinguish "exit after an already-completed checkout" (e.g. a Face ID
+  // scan hours after checking out) from "exit with no check-in at all".
+  const coDate = addDays(today, -rule.checkOutDayOffset);
+  const coRec = store.getAttendance(emp.id, coDate);
+  const doneRec = (coRec && coRec.departure) ? coRec : ((todayRec && todayRec.departure) ? todayRec : null);
+  if (doneRec) {
+    if (doneRec.departure > 0 && ts - doneRec.departure < 120 * 1000) {
+      return logEvent(`DEDUP inside ${kind}: ${emp.name} — door scan right after checkout`);
+    }
+    logEvent(`EXIT after checkout: ${emp.name}`);
+    await notifyDM(emp.id,
+      `🚪 <b>EXITED</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\nℹ️ You had already checked out — this exit is not counted.\n📟 ${devName}`);
+    appendRow([today, emp.id, emp.name, "Exited (after checkout)", fmtTime(ts), ""], companyFor(emp).sheetName);
+    return;
+  }
+  logEvent(`EXIT without check-in: ${emp.name}`);
+  await notifyDM(emp.id,
+    `🚪 <b>EXITED</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\nℹ️ No check-in recorded for today — this exit is not counted.\n📟 ${devName}`);
+  appendRow([today, emp.id, emp.name, "Exited (no check-in)", fmtTime(ts), ""], companyFor(emp).sheetName);
+  return;
 }
 
-// Break watchdog — sends ONE warning per overdue break
-setInterval(async () => {
-  const now = Date.now();
-  for (const b of store.overdueBreaks(cfg.BREAK_LIMIT_MIN * 60000, now)) {
-    store.markWarned(b.id);
+// Maintenance watchdog (every minute + at startup). Keeps state clean so
+// yesterday's leftovers can never confuse a new shift:
+//  A) Face ID exit in the CHECKOUT WINDOW with no return within
+//     FACE_EXIT_CHECKOUT_MIN -> converted into a real CHECKOUT (forgot the
+//     fingerprint, went home). If they return sooner it stays a break.
+//  B) Abandoned open breaks (outside the checkout window) -> 30-min warning
+//     once, then voided after STALE_BREAK_HOURS.
+//  C) Sessions never checked out -> closed automatically after their checkout
+//     window ends, so the next work day always starts with a clean state.
+async function runMaintenance(now = Date.now()) {
+  // --- A/B: open breaks ---
+  for (const b of store.allOpenBreaks()) {
     const emp = findEmployee(b.emp_id, true) || { id: b.emp_id, name: `Employee #${b.emp_id}` };
-    const dur = Math.round((now - b.out_ts) / 60000);
-    await notifyDM(b.emp_id,
-      `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}`);
-    appendRow([b.work_date, b.emp_id, emp.name, "WARNING", fmtTime(now), `Break ${dur} min — over limit`], companyFor(emp).sheetName);
+    const rule = SHIFT_RULES[emp.shiftKey];
+    const outM = localMinutes(b.out_ts);
+    const inCheckoutWin = rule && outM >= toMin(rule.validCheckOutFrom) && outM <= toMin(rule.validCheckOutTo);
+
+    if (inCheckoutWin) {
+      // Likely a departure with Face ID — wait FACE_EXIT_CHECKOUT_MIN, then
+      // convert to checkout. No 30-min break warning for these.
+      const rec = store.getAttendance(b.emp_id, b.work_date);
+      if (rec && rec.arrival && !rec.departure && now - b.out_ts > cfg.FACE_EXIT_CHECKOUT_MIN * 60000) {
+        store.voidBreak(b.id);
+        store.setDeparture(b.emp_id, b.work_date, b.out_ts);
+        const workedMin = Math.round((b.out_ts - rec.arrival) / 60000);
+        const worked = `${Math.floor(workedMin / 60)}h ${workedMin % 60}m`;
+        logEvent(`FACE-EXIT->CHECKOUT: ${emp.name} left at ${fmtTime(b.out_ts)} with Face ID and did not return`);
+        await notifyBoth(emp,
+          `🚪 <b>CHECKED OUT</b>\n👤 Name: ${emp.name} (ID: ${emp.id})\n🏷 Shift: ${rule.label}\n📅 Shift Date: ${b.work_date}\n🕐 ${fmtTime(b.out_ts)}\n⏱ Worked: ${worked}\nℹ️ Exited with Face ID after the shift and did not return — counted as checkout.`);
+        appendRow([b.work_date, emp.id, emp.name, "Checked out", fmtTime(b.out_ts), `Face ID exit, no return — auto checkout (worked ${worked})`], companyFor(emp).sheetName);
+      }
+      continue;
+    }
+
+    // Abandoned break: void after STALE_BREAK_HOURS so it can never swallow
+    // tomorrow's first entry as a fake "back from break".
+    if (now - b.out_ts > cfg.STALE_BREAK_HOURS * 3600 * 1000) {
+      store.voidBreak(b.id);
+      logEvent(`AUTO-VOID stale open break: ${emp.name} (out at ${fmtTime(b.out_ts)}, never returned)`);
+      appendRow([b.work_date, emp.id, emp.name, "Break voided", fmtTime(now), "Never returned — voided automatically"], companyFor(emp).sheetName);
+      continue;
+    }
+
+    if (!b.warned && now - b.out_ts > cfg.BREAK_LIMIT_MIN * 60000) {
+      store.markWarned(b.id);
+      const dur = Math.round((now - b.out_ts) / 60000);
+      await notifyDM(b.emp_id,
+        `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}`);
+      appendRow([b.work_date, b.emp_id, emp.name, "WARNING", fmtTime(now), `Break ${dur} min — over limit`], companyFor(emp).sheetName);
+    }
   }
-}, 60 * 1000);
+
+  // --- C: sessions that never checked out ---
+  for (const srow of store.staleSessions()) {
+    const emp = findEmployee(srow.emp_id, true);
+    const rule = emp && SHIFT_RULES[emp.shiftKey];
+    if (!rule) continue;
+    const deadline = Date.parse(`${addDays(srow.work_date, rule.checkOutDayOffset)}T${rule.validCheckOutTo}:00+05:00`);
+    if (Number.isFinite(deadline) && now > deadline) {
+      store.setDeparture(srow.emp_id, srow.work_date, -1); // sentinel: no checkout scan
+      logEvent(`AUTO-CLOSE session without checkout: ${emp.name} (${srow.work_date})`);
+      appendRow([srow.work_date, emp.id, emp.name, "Session closed", "-", "No checkout scan recorded — closed automatically"], companyFor(emp).sheetName);
+    }
+  }
+}
+
+setInterval(() => runMaintenance().catch((e) => console.error("maintenance error:", e.message)), 60 * 1000);
+if (!TEST_MODE) runMaintenance().catch(() => {}); // clean stale state at startup too
 
 // No-Show watchdog — if no check-in within (120 + lateAllowableMin) minutes
 // of shift start, alert the employee DM + the group ONCE per shift date.
@@ -655,5 +737,5 @@ if (!TEST_MODE) {
 }
 
 if (TEST_MODE) {
-  module.exports = { handleAuthEvent, processEvent, store };
+  module.exports = { handleAuthEvent, processEvent, store, runMaintenance };
 }
