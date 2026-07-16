@@ -23,6 +23,26 @@ module.exports = {
 
   DB_PATH: process.env.DB_PATH || "./attendance.db",
 
+  // ===== SPLIT (per-company instances, ONE shared bot token) =====
+  // master = handles Telegram polling (/start, /stop, /health) for everyone.
+  // worker = sends messages only (no polling -> no 409 Conflict).
+  TELEGRAM_MODE: (process.env.TELEGRAM_MODE || "master").toLowerCase(),
+  // false = this instance NEVER polls Telegram (no /start handling) — DM chat
+  // ids come from employees.json "chatId" fields instead. This lets ANY number
+  // of fully independent instances share one bot token with zero conflicts.
+  TELEGRAM_POLLING: (process.env.TELEGRAM_POLLING || "true").toLowerCase() !== "false",
+  // Events are processed ONLY for employees of this company (empty = all).
+  MY_COMPANY: (process.env.MY_COMPANY || "").trim().toLowerCase(),
+  // Shared subscriptions DB so DMs work from every instance (empty = local).
+  SHARED_DB_PATH: (process.env.SHARED_DB_PATH || "").trim(),
+  // Stagger polling across instances to keep device load low.
+  POLL_INTERVAL_MS: +(process.env.POLL_INTERVAL_MS || 4000),
+  // Devices allow a limited number of concurrent alertStream connections.
+  // With several instances, keep the stream on ONE bot only; the others rely
+  // on their pollers (guaranteed delivery) — this prevents "too many
+  // requests" / connection-reset churn on the devices.
+  ALERTSTREAM_ENABLED: (process.env.ALERTSTREAM_ENABLED || "true").toLowerCase() !== "false",
+
   SHEET: {
     id: process.env.GOOGLE_SHEET_ID || "",
     name: process.env.GOOGLE_SHEET_NAME || "Sheet1",

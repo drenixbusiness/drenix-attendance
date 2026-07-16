@@ -1,11 +1,23 @@
 // Node ichki SQLite moduli (Node 22.5+) — native kompilyatsiya kerak emas
 const { DatabaseSync } = require("node:sqlite");
+const fs = require("fs");
+const path = require("path");
 const cfg = require("./config");
 
-const db = new DatabaseSync(cfg.DB_PATH);
-db.exec("PRAGMA journal_mode = WAL;");
+function openDb(p) {
+  fs.mkdirSync(path.dirname(path.resolve(p)), { recursive: true });
+  const d = new DatabaseSync(p);
+  d.exec("PRAGMA journal_mode = WAL;");
+  return d;
+}
 
-db.exec(`
+const db = openDb(cfg.DB_PATH);
+// Subscriptions live in a SHARED database when SHARED_DB_PATH is set, so a
+// /start registration done on the MASTER instance is visible to every worker
+// instance (they read chat ids from here to send DMs).
+const subsDb = cfg.SHARED_DB_PATH ? openDb(cfg.SHARED_DB_PATH) : db;
+
+subsDb.exec(`
 CREATE TABLE IF NOT EXISTS subscriptions (
   chat_id TEXT PRIMARY KEY,
   emp_id  TEXT NOT NULL
@@ -13,6 +25,9 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 CREATE TABLE IF NOT EXISTS pending (
   chat_id TEXT PRIMARY KEY
 );
+`);
+
+db.exec(`
 CREATE TABLE IF NOT EXISTS attendance (
   emp_id    TEXT NOT NULL,
   work_date TEXT NOT NULL,
@@ -37,19 +52,19 @@ CREATE TABLE IF NOT EXISTS breaks (
 
 module.exports = {
   // --- obunalar ---
-  setPending: (chatId) => db.prepare("INSERT OR REPLACE INTO pending (chat_id) VALUES (?)").run(String(chatId)),
-  isPending: (chatId) => !!db.prepare("SELECT 1 AS x FROM pending WHERE chat_id=?").get(String(chatId)),
-  clearPending: (chatId) => db.prepare("DELETE FROM pending WHERE chat_id=?").run(String(chatId)),
+  setPending: (chatId) => subsDb.prepare("INSERT OR REPLACE INTO pending (chat_id) VALUES (?)").run(String(chatId)),
+  isPending: (chatId) => !!subsDb.prepare("SELECT 1 AS x FROM pending WHERE chat_id=?").get(String(chatId)),
+  clearPending: (chatId) => subsDb.prepare("DELETE FROM pending WHERE chat_id=?").run(String(chatId)),
 
   subscribe: (chatId, empId) =>
-    db.prepare("INSERT OR REPLACE INTO subscriptions (chat_id, emp_id) VALUES (?, ?)").run(String(chatId), String(empId)),
-  unsubscribe: (chatId) => db.prepare("DELETE FROM subscriptions WHERE chat_id=?").run(String(chatId)),
+    subsDb.prepare("INSERT OR REPLACE INTO subscriptions (chat_id, emp_id) VALUES (?, ?)").run(String(chatId), String(empId)),
+  unsubscribe: (chatId) => subsDb.prepare("DELETE FROM subscriptions WHERE chat_id=?").run(String(chatId)),
   subscriptionFor: (chatId) => {
-    const r = db.prepare("SELECT emp_id FROM subscriptions WHERE chat_id=?").get(String(chatId));
+    const r = subsDb.prepare("SELECT emp_id FROM subscriptions WHERE chat_id=?").get(String(chatId));
     return r ? r.emp_id : null;
   },
   chatsForEmployee: (empId) =>
-    db.prepare("SELECT chat_id FROM subscriptions WHERE emp_id=?").all(String(empId)).map(r => r.chat_id),
+    subsDb.prepare("SELECT chat_id FROM subscriptions WHERE emp_id=?").all(String(empId)).map(r => r.chat_id),
 
   // --- davomat ---
   getAttendance: (empId, workDate) =>

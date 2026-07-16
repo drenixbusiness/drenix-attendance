@@ -137,8 +137,21 @@ async function sendToGroup(text, chatId = cfg.GROUP_CHAT_ID) {
   }
 }
 
+// DM targets = DB subscriptions (/start flow) UNION static "chatId" values
+// from employees.json ("chatId": "123456789" or ["id1","id2"]). The static
+// form needs no polling at all, so independent instances never conflict.
+function chatIdsFor(empId) {
+  const ids = new Set(store.chatsForEmployee(empId).map(String));
+  const info = EMPLOYEES[empId];
+  if (info && info.chatId) {
+    const c = info.chatId;
+    (Array.isArray(c) ? c : [c]).forEach((x) => x && ids.add(String(x)));
+  }
+  return [...ids];
+}
+
 async function sendToEmployee(empId, text) {
-  for (const chatId of store.chatsForEmployee(empId)) {
+  for (const chatId of chatIdsFor(empId)) {
     try {
       await bot.telegram.sendMessage(chatId, text, { parse_mode: "HTML" });
     } catch (e) {
@@ -295,19 +308,17 @@ async function doBreakIn(emp, ts, devName, open) {
   store.endBreak(open.id, ts);
   const dur = Math.round((ts - open.out_ts) / 60000);
   const over = dur > cfg.BREAK_LIMIT_MIN;
-  await notifyDM(emp.id,
-    `↩️ <b>BACK FROM BREAK</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\n⏱ Duration: ${minWord(dur)}` +
-    (over ? `\n🔴 <b>Exceeded the limit by ${minWord(dur - cfg.BREAK_LIMIT_MIN)}!</b>` : `\n✅ Within the limit`) +
-    `\n📟 ${devName}`);
+  // No Telegram message for break returns — tracked in events.log and Sheets.
+  console.log(`[break in] ${emp.name} @ ${fmtTime(ts)} — ${dur} min${over ? " (OVER LIMIT)" : ""}`);
   appendRow([open.work_date, emp.id, emp.name, "Back from break", fmtTime(ts),
     over ? `${dur} min (over limit)` : `${dur} min`], companyFor(emp).sheetName);
 }
 
 async function doBreakOut(emp, ts, devName, workDate, note = "") {
   store.startBreak(emp.id, workDate, ts);
-  await notifyDM(emp.id,
-    `☕ <b>ON BREAK</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\n⏳ Limit: ${minWord(cfg.BREAK_LIMIT_MIN)}` +
-    (note ? `\nℹ️ ${note}` : "") + `\n📟 ${devName}`);
+  // No Telegram message for normal break-outs — only the 30-min warning is
+  // sent. Everything is still tracked in events.log and Google Sheets.
+  console.log(`[break out] ${emp.name} @ ${fmtTime(ts)} (${devName})${note ? " — " + note : ""}`);
   appendRow([workDate, emp.id, emp.name, "Break started", fmtTime(ts), note], companyFor(emp).sheetName);
 }
 
@@ -349,8 +360,7 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
       return logEvent(`DEDUP outside ${kind}: ${emp.name} — repeated door scan`);
     }
     logEvent(`ENTER-only outside ${kind}: ${emp.name} — no matching exit scan before this entry`);
-    await notifyDM(emp.id,
-      `🚶 <b>ENTERED</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\nℹ️ No exit scan was recorded before this entry, so no break was counted.\n📟 ${devName}`);
+    console.log(`[entered] ${emp.name} @ ${fmtTime(ts)} — no prior exit scan, no break counted`);
     appendRow([today, emp.id, emp.name, "Entered (no exit scan)", fmtTime(ts), ""], companyFor(emp).sheetName);
     return;
   }
@@ -376,8 +386,7 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
         return logEvent(`DEDUP inside ${kind}: ${emp.name} — door scan right after checkout`);
       }
       logEvent(`EXIT after checkout: ${emp.name} (${workDate})`);
-      await notifyDM(emp.id,
-        `🚪 <b>EXITED</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\nℹ️ You had already checked out — this exit is not counted.\n📟 ${devName}`);
+      console.log(`[exited] ${emp.name} @ ${fmtTime(ts)} — already checked out`);
       appendRow([workDate, emp.id, emp.name, "Exited (after checkout)", fmtTime(ts), ""], companyFor(emp).sheetName);
       return;
     }
@@ -421,14 +430,12 @@ async function handleAuthEvent(emp, ts, deviceIp, kind) {
       return logEvent(`DEDUP inside ${kind}: ${emp.name} — door scan right after checkout`);
     }
     logEvent(`EXIT after checkout: ${emp.name}`);
-    await notifyDM(emp.id,
-      `🚪 <b>EXITED</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\nℹ️ You had already checked out — this exit is not counted.\n📟 ${devName}`);
+    console.log(`[exited] ${emp.name} @ ${fmtTime(ts)} — already checked out`);
     appendRow([today, emp.id, emp.name, "Exited (after checkout)", fmtTime(ts), ""], companyFor(emp).sheetName);
     return;
   }
   logEvent(`EXIT without check-in: ${emp.name}`);
-  await notifyDM(emp.id,
-    `🚪 <b>EXITED</b>\n👤 ${emp.name}\n🕐 ${fmtTime(ts)}\nℹ️ No check-in recorded for today — this exit is not counted.\n📟 ${devName}`);
+  console.log(`[exited] ${emp.name} @ ${fmtTime(ts)} — no check-in today`);
   appendRow([today, emp.id, emp.name, "Exited (no check-in)", fmtTime(ts), ""], companyFor(emp).sheetName);
   return;
 }
@@ -479,7 +486,7 @@ async function runMaintenance(now = Date.now()) {
     if (!b.warned && now - b.out_ts > cfg.BREAK_LIMIT_MIN * 60000) {
       store.markWarned(b.id);
       const dur = Math.round((now - b.out_ts) / 60000);
-      await notifyDM(b.emp_id,
+      await notifyBoth(emp,
         `🔴 <b>WARNING!</b>\n👤 ${emp.name}\n☕ Has been on break for <b>${minWord(dur)}</b> — exceeded the ${minWord(cfg.BREAK_LIMIT_MIN)} limit and has not returned yet!\n🕐 Left at: ${fmtTime(b.out_ts)}`);
       appendRow([b.work_date, b.emp_id, emp.name, "WARNING", fmtTime(now), `Break ${dur} min — over limit`], companyFor(emp).sheetName);
     }
@@ -510,6 +517,7 @@ setInterval(async () => {
   const today = fmtDate(now);
   const m = localMinutes(now);
   for (const [id, info] of Object.entries(EMPLOYEES)) {
+    if (cfg.MY_COMPANY && (info.company || "").toLowerCase() !== cfg.MY_COMPANY) continue;
     const rule = SHIFT_RULES[info.shiftKey];
     if (!rule) continue;
     const graceMin = 120 + rule.lateAllowableMin; // e.g. 130 minutes
@@ -611,6 +619,12 @@ async function processEvent(evt, sourceIp, source) {
     const emp = findEmployee(rawId, true); // exact — device IDs are verbatim
     if (!emp) return logEvent(`IGNORE: empId=${rawId} not found in employees.json`);
 
+    // Split deployment: each instance processes ONLY its own company's
+    // employees, so two instances can never double-handle the same scan.
+    if (cfg.MY_COMPANY && (emp.company || "").toLowerCase() !== cfg.MY_COMPANY) {
+      return logEvent(`SKIP: ${emp.name} belongs to '${emp.company}' — handled by that company's instance`);
+    }
+
     if (!kind) {
       // Unrecognized auth code: keep the raw dump for diagnostics, but do NOT
       // drop the event — the direction-based logic below can still use it
@@ -699,6 +713,17 @@ const ALL_DEVICE_IPS = [...new Set([...cfg.INSIDE_IPS, ...cfg.OUTSIDE_IPS])];
 
 if (TEST_MODE) {
   // no device connections in unit tests
+} else if (!cfg.ALERTSTREAM_ENABLED) {
+  console.log("alertStream disabled by config (ALERTSTREAM_ENABLED=false) — poller-only mode, this is fine");
+  if (cfg.DEVICE_PASSWORD) {
+    for (const ip of ALL_DEVICE_IPS) {
+      startPolling(ip, cfg.DEVICE_HTTP_PORT, cfg.DEVICE_USERNAME, cfg.DEVICE_PASSWORD, (evt, deviceIp) => {
+        processEvent(evt, deviceIp, "poll");
+      }, console.log, cfg.POLL_INTERVAL_MS);
+    }
+  } else {
+    console.warn("⚠️  DEVICE_PASSWORD is empty — no device connection possible.");
+  }
 } else if (!cfg.DEVICE_PASSWORD) {
   console.warn("⚠️  DEVICE_PASSWORD is empty in .env — alertStream (real-time pull) is DISABLED.");
   console.warn("    Set DEVICE_USERNAME / DEVICE_PASSWORD (the device web-login credentials) to enable it.");
@@ -707,7 +732,7 @@ if (TEST_MODE) {
     // Guaranteed path: poll the device for new events every 4 seconds
     startPolling(ip, cfg.DEVICE_HTTP_PORT, cfg.DEVICE_USERNAME, cfg.DEVICE_PASSWORD, (evt, deviceIp) => {
       processEvent(evt, deviceIp, "poll");
-    });
+    }, console.log, cfg.POLL_INTERVAL_MS);
     subscribeDevice(
       ip, cfg.DEVICE_HTTP_PORT, cfg.DEVICE_USERNAME, cfg.DEVICE_PASSWORD,
       (evt, deviceIp) => {
@@ -728,12 +753,21 @@ if (!TEST_MODE) {
   });
 
   bot.telegram.getMe()
-    .then((me) => console.log(`Telegram OK ✅ — bot @${me.username} is ready`))
+    .then((me) => console.log(`Telegram OK ✅ — bot @${me.username} is ready (${cfg.TELEGRAM_MODE} mode)`))
     .catch((e) => console.error(`TELEGRAM ERROR ❌ — token or network problem: ${e.message}`));
-  bot.launch().catch((e) => console.error(`bot.launch failed: ${e.message}`));
 
-  process.once("SIGINT", () => bot.stop("SIGINT"));
-  process.once("SIGTERM", () => bot.stop("SIGTERM"));
+  if (!cfg.TELEGRAM_POLLING || cfg.TELEGRAM_MODE === "worker") {
+    // Workers only SEND messages. Polling stays off so the single shared bot
+    // token never hits Telegram's 409 Conflict; /start /stop /health are
+    // handled by the MASTER instance for all companies.
+    console.log(cfg.TELEGRAM_POLLING
+      ? "Worker mode: Telegram polling disabled — /start is handled by the master instance"
+      : "Independent mode: Telegram polling disabled — DM chat ids come from employees.json (chatId)");
+  } else {
+    bot.launch().catch((e) => console.error(`bot.launch failed: ${e.message}`));
+    process.once("SIGINT", () => bot.stop("SIGINT"));
+    process.once("SIGTERM", () => bot.stop("SIGTERM"));
+  }
 }
 
 if (TEST_MODE) {
